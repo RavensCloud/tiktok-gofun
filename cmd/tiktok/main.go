@@ -96,13 +96,17 @@ func main() {
 }
 
 func printAuthor(a tiktok.Author) {
-	fmt.Printf("User:      %s\n", a.Username)
-	fmt.Printf("ID:        %s\n", a.ID)
-	fmt.Printf("Followers: %d\n", a.FollowerCount)
-	fmt.Printf("Following: %d\n", a.FollowingCount)
-	fmt.Printf("Videos:    %d\n", a.VideoCount)
-	fmt.Printf("Verified:  %v\n", a.Verified)
-	fmt.Printf("Bio:       %s\n", a.Bio)
+	fmt.Printf("User:       %s\n", a.Username)
+	fmt.Printf("Nickname:   %s\n", a.Nickname)
+	fmt.Printf("ID:         %s\n", a.ID)
+	fmt.Printf("Followers:  %d\n", a.FollowerCount)
+	fmt.Printf("Following:  %d\n", a.FollowingCount)
+	fmt.Printf("Videos:     %d\n", a.VideoCount)
+	fmt.Printf("Hearts:     %d\n", a.HeartCount)
+	fmt.Printf("Diggs:      %d\n", a.DiggCount)
+	fmt.Printf("Verified:   %v\n", a.Verified)
+	fmt.Printf("Bio:        %s\n", a.Bio)
+	fmt.Printf("Avatar:     %s\n", a.AvatarURL)
 }
 
 func printVideos(videos []tiktok.Video) {

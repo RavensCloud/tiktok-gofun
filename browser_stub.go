@@ -21,6 +21,10 @@ func (s *Scraper) signURL(rawURL string) (string, error) {
 	return "", ErrBrowserNotReady
 }
 
+func (s *Scraper) browserFetch(rawURL string) ([]byte, error) {
+	return nil, ErrBrowserNotReady
+}
+
 func (s *Scraper) ensureSigningReady() error {
 	if s.signingReady.Load() {
 		return nil

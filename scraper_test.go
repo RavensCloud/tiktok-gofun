@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,7 +27,7 @@ func ssrPage(username, id string, followers int) string {
 		`</script></body></html>`
 }
 
-// searchJSON returns a valid search API response body.
+// searchJSON returns a valid search API response body matching TikTok's format.
 func searchJSON(count int, hasMore bool, cursor int) string {
 	items := make([]string, 0, count)
 	for i := range count {
@@ -38,8 +39,12 @@ func searchJSON(count int, hasMore bool, cursor int) string {
 			"stats": {"playCount": %d, "diggCount": 50, "shareCount": 10, "commentCount": 5}
 		}`, 1000+i, i, i, 200+i, (i+1)*1000))
 	}
-	return fmt.Sprintf(`{"item_list": [%s], "has_more": %v, "cursor": %d}`,
-		strings.Join(items, ","), hasMore, cursor)
+	hasMoreInt := 0
+	if hasMore {
+		hasMoreInt = 1
+	}
+	return fmt.Sprintf(`{"status_code":0,"item_list": [%s], "has_more": %d, "cursor": %d}`,
+		strings.Join(items, ","), hasMoreInt, cursor)
 }
 
 // challengeDetailJSON returns a valid challenge detail API response body.
@@ -64,11 +69,30 @@ func challengeItemsJSON(count int, hasMore bool, cursor int) string {
 }
 
 // newMockScraper creates a Scraper pointing at the given test server with zero
-// delays and a no-op sign function (returns URL as-is).
+// delays and mock fetch/sign functions that bypass the browser.
 func newMockScraper(serverURL string) *Scraper {
 	s := New().WithSearchDelay(0).WithProfileDelay(0)
 	s.baseURL = serverURL
 	s.signFunc = func(rawURL string) (string, error) { return rawURL, nil }
+	// Mock fetchFunc: do a plain HTTP GET with error handling (no browser).
+	s.fetchFunc = func(rawURL string) ([]byte, error) {
+		resp, err := s.client.Get(rawURL)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			return nil, ErrRateLimited
+		case http.StatusNotFound:
+			return nil, ErrNotFound
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
 	return s
 }
 
@@ -107,6 +131,9 @@ func TestNew(t *testing.T) {
 	}
 	if s.signFunc == nil {
 		t.Fatal("expected signFunc to be initialized")
+	}
+	if len(s.deviceID) != 19 {
+		t.Errorf("expected 19-digit deviceID, got %q (len %d)", s.deviceID, len(s.deviceID))
 	}
 }
 
@@ -174,6 +201,43 @@ func TestSetProxy_EmptyResetsTransport(t *testing.T) {
 // doRequest tests (with httptest)
 // ---------------------------------------------------------------------------
 
+func TestBuildAPIParams(t *testing.T) {
+	t.Parallel()
+	s := New()
+	s.msToken = "testtoken123"
+
+	params := s.buildAPIParams()
+
+	// Check required TikTok API params.
+	checks := map[string]string{
+		"aid":             "1988",
+		"app_name":        "tiktok_web",
+		"device_platform": "web_pc",
+		"cookie_enabled":  "true",
+		"channel":         "tiktok_web",
+		"browser_online":  "true",
+		"region":          "US",
+		"language":        "en",
+		"os":              "mac",
+		"msToken":         "testtoken123",
+		"device_id":       s.deviceID,
+	}
+	for key, want := range checks {
+		if got := params.Get(key); got != want {
+			t.Errorf("buildAPIParams[%s] = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestBuildAPIParams_NoMsToken(t *testing.T) {
+	t.Parallel()
+	s := New()
+	params := s.buildAPIParams()
+	if params.Get("msToken") != "" {
+		t.Errorf("expected empty msToken, got %q", params.Get("msToken"))
+	}
+}
+
 func TestDoRequest_Success(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -191,6 +255,16 @@ func TestDoRequest_Success(t *testing.T) {
 		}
 		if r.Header.Get("Accept") != "application/json, text/plain, */*" {
 			t.Errorf("missing accept header")
+		}
+		// Verify Sec-* headers are present.
+		if r.Header.Get("Sec-Ch-Ua-Mobile") != "?0" {
+			t.Errorf("missing Sec-Ch-Ua-Mobile header")
+		}
+		if r.Header.Get("Sec-Fetch-Mode") != "cors" {
+			t.Errorf("missing Sec-Fetch-Mode header")
+		}
+		if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+			t.Errorf("missing Sec-Fetch-Site header")
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"ok":true}`))
@@ -530,18 +604,18 @@ func TestSearchVideos_EmptyKeyword(t *testing.T) {
 
 func TestSearchVideos_NoBrowser(t *testing.T) {
 	t.Parallel()
-	s := New()
+	s := New().WithSearchDelay(0)
 	_, err := s.SearchVideos(context.Background(), "bonk", 10)
 	if !errors.Is(err, ErrBrowserNotReady) {
 		t.Errorf("expected ErrBrowserNotReady, got %v", err)
 	}
 }
 
-func TestSearchVideos_SignError(t *testing.T) {
+func TestSearchVideos_FetchError(t *testing.T) {
 	t.Parallel()
 	s := New().WithSearchDelay(0)
-	s.signFunc = func(rawURL string) (string, error) {
-		return "", fmt.Errorf("sign failed: %w", ErrSigningFailed)
+	s.fetchFunc = func(rawURL string) ([]byte, error) {
+		return nil, fmt.Errorf("fetch failed: %w", ErrSigningFailed)
 	}
 
 	_, err := s.SearchVideos(context.Background(), "bonk", 10)
@@ -673,7 +747,7 @@ func TestSearchByHashtag_EmptyHashtag(t *testing.T) {
 
 func TestSearchByHashtag_NoBrowser(t *testing.T) {
 	t.Parallel()
-	s := New()
+	s := New().WithSearchDelay(0)
 	_, err := s.SearchByHashtag(context.Background(), "bonk", 10)
 	if !errors.Is(err, ErrBrowserNotReady) {
 		t.Errorf("expected ErrBrowserNotReady, got %v", err)
@@ -1057,6 +1131,7 @@ func TestParseAuthor(t *testing.T) {
 		User: rawUserDetail{
 			ID:           "700000000",
 			UniqueID:     "testuser",
+			Nickname:     "Test User",
 			AvatarLarger: "https://img.tiktok.com/avatar.jpg",
 			Signature:    "my bio text",
 			Verified:     true,
@@ -1065,6 +1140,8 @@ func TestParseAuthor(t *testing.T) {
 			FollowerCount:  15000,
 			FollowingCount: 200,
 			VideoCount:     120,
+			HeartCount:     85000,
+			DiggCount:      3200,
 		},
 	}
 
@@ -1076,6 +1153,9 @@ func TestParseAuthor(t *testing.T) {
 	if a.Username != "testuser" {
 		t.Errorf("expected username testuser, got %s", a.Username)
 	}
+	if a.Nickname != "Test User" {
+		t.Errorf("expected nickname %q, got %q", "Test User", a.Nickname)
+	}
 	if a.FollowerCount != 15000 {
 		t.Errorf("expected 15000 followers, got %d", a.FollowerCount)
 	}
@@ -1084,6 +1164,12 @@ func TestParseAuthor(t *testing.T) {
 	}
 	if a.VideoCount != 120 {
 		t.Errorf("expected 120 videos, got %d", a.VideoCount)
+	}
+	if a.HeartCount != 85000 {
+		t.Errorf("expected 85000 hearts, got %d", a.HeartCount)
+	}
+	if a.DiggCount != 3200 {
+		t.Errorf("expected 3200 diggs, got %d", a.DiggCount)
 	}
 	if a.Bio != "my bio text" {
 		t.Errorf("expected bio %q, got %q", "my bio text", a.Bio)
@@ -1109,11 +1195,14 @@ func TestSearchResponseDeserialization(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
+	if resp.StatusCode != 0 {
+		t.Errorf("expected status_code=0, got %d", resp.StatusCode)
+	}
 	if len(resp.ItemList) != 2 {
 		t.Fatalf("expected 2 items, got %d", len(resp.ItemList))
 	}
-	if !resp.HasMore {
-		t.Error("expected has_more=true")
+	if resp.HasMore != 1 {
+		t.Error("expected has_more=1")
 	}
 	if resp.Cursor != 20 {
 		t.Errorf("expected cursor=20, got %d", resp.Cursor)
@@ -1196,11 +1285,11 @@ func TestDoRequest_InvalidURL(t *testing.T) {
 	}
 }
 
-func TestSearchByHashtag_SignError(t *testing.T) {
+func TestSearchByHashtag_FetchError(t *testing.T) {
 	t.Parallel()
 	s := New().WithSearchDelay(0)
-	s.signFunc = func(rawURL string) (string, error) {
-		return "", fmt.Errorf("sign failed: %w", ErrSigningFailed)
+	s.fetchFunc = func(rawURL string) ([]byte, error) {
+		return nil, fmt.Errorf("fetch failed: %w", ErrSigningFailed)
 	}
 	_, err := s.SearchByHashtag(context.Background(), "bonk", 10)
 	if !errors.Is(err, ErrSigningFailed) {
@@ -1208,24 +1297,18 @@ func TestSearchByHashtag_SignError(t *testing.T) {
 	}
 }
 
-func TestSearchByHashtag_ItemListSignError(t *testing.T) {
+func TestSearchByHashtag_ItemListFetchError(t *testing.T) {
 	t.Parallel()
 	callCount := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/api/challenge/detail") {
-			w.Write([]byte(challengeDetailJSON("789", "bonk")))
-		}
-	}))
-	defer srv.Close()
-
 	s := New().WithSearchDelay(0).WithProfileDelay(0)
-	s.baseURL = srv.URL
-	s.signFunc = func(rawURL string) (string, error) {
+	s.fetchFunc = func(rawURL string) ([]byte, error) {
 		callCount++
 		if callCount <= 1 {
-			return rawURL, nil
+			// First call: challenge detail — return success.
+			return []byte(challengeDetailJSON("789", "bonk")), nil
 		}
-		return "", fmt.Errorf("sign hashtag: %w", ErrSigningFailed)
+		// Second call: item_list — return error.
+		return nil, fmt.Errorf("fetch hashtag: %w", ErrSigningFailed)
 	}
 
 	_, err := s.SearchByHashtag(context.Background(), "bonk", 10)

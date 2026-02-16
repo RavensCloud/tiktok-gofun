@@ -2,12 +2,15 @@ package tiktok
 
 import "time"
 
-// Search API response.
+// Search API response — flat structure returned by TikTok's API when
+// fetched via the browser. Fields are at the top level, not wrapped in a
+// "data" envelope.
 
 type searchResponse struct {
-	ItemList []rawVideo `json:"item_list"`
-	HasMore  bool       `json:"has_more"`
-	Cursor   int        `json:"cursor"`
+	StatusCode int        `json:"status_code"`
+	ItemList   []rawVideo `json:"item_list"`
+	HasMore    int        `json:"has_more"` // 0 or 1, not bool.
+	Cursor     int        `json:"cursor"`
 }
 
 // Challenge/hashtag API responses.
@@ -121,9 +124,12 @@ func parseAuthor(raw rawUserInfo) Author {
 	return Author{
 		ID:             raw.User.ID,
 		Username:       raw.User.UniqueID,
+		Nickname:       raw.User.Nickname,
 		FollowerCount:  raw.Stats.FollowerCount,
 		FollowingCount: raw.Stats.FollowingCount,
 		VideoCount:     raw.Stats.VideoCount,
+		HeartCount:     raw.Stats.HeartCount,
+		DiggCount:      raw.Stats.DiggCount,
 		Verified:       raw.User.Verified,
 		Bio:            raw.User.Signature,
 		AvatarURL:      raw.User.AvatarLarger,

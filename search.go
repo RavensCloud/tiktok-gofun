@@ -4,9 +4,40 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strconv"
 )
+
+// browserAPIRequest builds the full API URL and fetches it via the browser.
+// The browser signs the URL (X-Bogus) and makes the HTTP request itself,
+// ensuring the TLS fingerprint, cookies, and session are all consistent.
+func (s *Scraper) browserAPIRequest(
+	_ context.Context,
+	path string,
+	setParams func(p map[string]string),
+) ([]byte, error) {
+	params := s.buildAPIParams()
+
+	// Apply caller-specific params.
+	extra := make(map[string]string)
+	setParams(extra)
+	for k, v := range extra {
+		params.Set(k, v)
+	}
+
+	rawURL := s.baseURL + path + "?" + params.Encode()
+
+	s.browserMu.Lock()
+	body, err := s.fetchFunc(rawURL)
+	s.browserMu.Unlock()
+	if err != nil {
+		return nil, fmt.Errorf("browser fetch: %w", err)
+	}
+
+	if len(body) == 0 {
+		return nil, fmt.Errorf("%w: empty response", ErrInvalidResponse)
+	}
+	return body, nil
+}
 
 // SearchVideos searches TikTok for videos matching the keyword.
 // Requires an initialized browser (InitBrowser) and authentication.
@@ -19,6 +50,8 @@ func (s *Scraper) SearchVideos(ctx context.Context, keyword string, limit int) (
 	cursor := 0
 
 	for len(allVideos) < limit {
+		s.waitForSearch()
+
 		videos, nextCursor, err := s.fetchSearch(ctx, keyword, cursor)
 		if err != nil {
 			return allVideos, fmt.Errorf("search videos %q: %w", keyword, err)
@@ -37,31 +70,19 @@ func (s *Scraper) SearchVideos(ctx context.Context, keyword string, limit int) (
 }
 
 func (s *Scraper) fetchSearch(ctx context.Context, keyword string, cursor int) ([]Video, int, error) {
-	rawURL := fmt.Sprintf(
-		"%s/api/search/item/full/?keyword=%s&count=20&cursor=%d&from_page=search",
-		s.baseURL, url.QueryEscape(keyword), cursor,
-	)
-
-	// Sign URL via browser JS (~50ms). Mutex protects single-threaded browser page.
-	s.browserMu.Lock()
-	signedURL, err := s.signFunc(rawURL)
-	s.browserMu.Unlock()
+	body, err := s.browserAPIRequest(ctx, "/api/search/item/full/", func(p map[string]string) {
+		p["keyword"] = keyword
+		p["count"] = "20"
+		p["cursor"] = strconv.Itoa(cursor)
+		p["from_page"] = "search"
+	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("sign search url: %w", err)
+		return nil, 0, fmt.Errorf("search request: %w", err)
 	}
-
-	// Rate limit before the HTTP call, not the signing.
-	s.waitForSearch()
-
-	resp, err := s.doRequest(ctx, "GET", signedURL, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
 
 	var result searchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, 0, fmt.Errorf("decode search response: %w", err)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, 0, fmt.Errorf("decode search response (len %d): %w", len(body), err)
 	}
 
 	videos := make([]Video, 0, len(result.ItemList))
@@ -70,7 +91,7 @@ func (s *Scraper) fetchSearch(ctx context.Context, keyword string, cursor int) (
 	}
 
 	nextCursor := 0
-	if result.HasMore {
+	if result.HasMore == 1 {
 		nextCursor = result.Cursor
 	}
 	return videos, nextCursor, nil
@@ -92,6 +113,8 @@ func (s *Scraper) SearchByHashtag(ctx context.Context, hashtag string, limit int
 	cursor := 0
 
 	for len(allVideos) < limit {
+		s.waitForSearch()
+
 		videos, nextCursor, err := s.fetchHashtagVideos(ctx, challengeID, cursor)
 		if err != nil {
 			return allVideos, fmt.Errorf("fetch hashtag videos %q: %w", hashtag, err)
@@ -110,28 +133,15 @@ func (s *Scraper) SearchByHashtag(ctx context.Context, hashtag string, limit int
 }
 
 func (s *Scraper) getChallengeID(ctx context.Context, hashtag string) (string, error) {
-	rawURL := fmt.Sprintf(
-		"%s/api/challenge/detail/?challengeName=%s",
-		s.baseURL, url.QueryEscape(hashtag),
-	)
-
-	s.browserMu.Lock()
-	signedURL, err := s.signFunc(rawURL)
-	s.browserMu.Unlock()
+	body, err := s.browserAPIRequest(ctx, "/api/challenge/detail/", func(p map[string]string) {
+		p["challengeName"] = hashtag
+	})
 	if err != nil {
-		return "", fmt.Errorf("sign challenge url: %w", err)
+		return "", fmt.Errorf("challenge detail: %w", err)
 	}
-
-	s.waitForSearch()
-
-	resp, err := s.doRequest(ctx, "GET", signedURL, nil)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
 
 	var result challengeDetailResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("decode challenge detail: %w", err)
 	}
 
@@ -142,28 +152,17 @@ func (s *Scraper) getChallengeID(ctx context.Context, hashtag string) (string, e
 }
 
 func (s *Scraper) fetchHashtagVideos(ctx context.Context, challengeID string, cursor int) ([]Video, int, error) {
-	rawURL := fmt.Sprintf(
-		"%s/api/challenge/item_list/?challengeID=%s&count=35&cursor=%s",
-		s.baseURL, url.QueryEscape(challengeID), strconv.Itoa(cursor),
-	)
-
-	s.browserMu.Lock()
-	signedURL, err := s.signFunc(rawURL)
-	s.browserMu.Unlock()
+	body, err := s.browserAPIRequest(ctx, "/api/challenge/item_list/", func(p map[string]string) {
+		p["challengeID"] = challengeID
+		p["count"] = "35"
+		p["cursor"] = strconv.Itoa(cursor)
+	})
 	if err != nil {
-		return nil, 0, fmt.Errorf("sign hashtag url: %w", err)
+		return nil, 0, fmt.Errorf("hashtag videos: %w", err)
 	}
-
-	s.waitForSearch()
-
-	resp, err := s.doRequest(ctx, "GET", signedURL, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
 
 	var result challengeItemListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, 0, fmt.Errorf("decode hashtag videos: %w", err)
 	}
 

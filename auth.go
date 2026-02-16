@@ -104,5 +104,15 @@ func (s *Scraper) LoginWithCookies(path string) error {
 		}
 	}
 
-	return nil
+	// Reload page so signing JS picks up the auth cookies.
+	if err := s.page.Navigate(s.baseURL); err != nil {
+		return fmt.Errorf("reload after cookie set: %w", err)
+	}
+	if err := s.page.WaitStable(2 * time.Second); err != nil {
+		return fmt.Errorf("wait after cookie reload: %w", err)
+	}
+	s.signingReady.Store(true)
+
+	// Sync fresh browser cookies (including new msToken) to HTTP client.
+	return s.syncCookiesFromBrowser()
 }

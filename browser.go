@@ -54,7 +54,8 @@ func (s *Scraper) launchBrowser() error {
 	// Cache that signing is ready after initial page load.
 	s.signingReady.Store(true)
 
-	return nil
+	// Sync browser cookies (including fresh msToken) to the HTTP client.
+	return s.syncCookiesFromBrowser()
 }
 
 func (s *Scraper) setupResourceBlocking() {
@@ -109,6 +110,60 @@ func (s *Scraper) signURL(rawURL string) (string, error) {
 	return result.Value.String(), nil
 }
 
+// browserFetch signs a URL and fetches it inside the browser via JS fetch().
+// This ensures the request uses the browser's TLS fingerprint, cookies, and
+// session — avoiding detection from fingerprint mismatches between Go's
+// net/http client and the browser that signed the URL.
+// Caller must hold browserMu.
+func (s *Scraper) browserFetch(rawURL string) ([]byte, error) {
+	if s.page == nil {
+		return nil, ErrBrowserNotReady
+	}
+
+	if err := s.ensureSigningReady(); err != nil {
+		return nil, fmt.Errorf("ensure signing ready: %w", err)
+	}
+
+	page := s.page.Timeout(15 * time.Second)
+
+	// Sign the URL and fetch it in one JS call to keep everything consistent.
+	result, err := page.Eval(`async (url) => {
+		if (typeof window.byted_acrawler === 'undefined') {
+			throw new Error('signing function not available');
+		}
+		const params = window.byted_acrawler.frontierSign(url);
+		let signedUrl;
+		if (typeof params === 'string') {
+			signedUrl = params;
+		} else {
+			const u = new URL(url);
+			for (const [k, v] of Object.entries(params)) {
+				u.searchParams.set(k, v);
+			}
+			signedUrl = u.toString();
+		}
+		const resp = await fetch(signedUrl, {
+			method: 'GET',
+			credentials: 'include',
+			headers: {
+				'Accept': 'application/json, text/plain, */*',
+			},
+		});
+		const text = await resp.text();
+		return text;
+	}`, rawURL)
+	if err != nil {
+		s.signingReady.Store(false)
+		return nil, fmt.Errorf("%w: %v", ErrSigningFailed, err)
+	}
+
+	body := result.Value.Str()
+	if body == "" {
+		return nil, nil
+	}
+	return []byte(body), nil
+}
+
 // ensureSigningReady checks if the signing JS is available, reloading only if
 // a previous call failed (cached via atomic bool to avoid overhead per call).
 func (s *Scraper) ensureSigningReady() error {
@@ -145,4 +200,3 @@ func (s *Scraper) closeBrowser() error {
 	}
 	return nil
 }
-

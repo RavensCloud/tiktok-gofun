@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,10 @@ type Scraper struct {
 	// signFunc signs a raw URL via browser JS. Replaceable for testing.
 	signFunc func(rawURL string) (string, error)
 
+	// fetchFunc signs a URL and fetches it inside the browser via JS fetch().
+	// Uses the browser's TLS fingerprint and cookies. Replaceable for testing.
+	fetchFunc func(rawURL string) ([]byte, error)
+
 	// Per-operation rate limiting.
 	// Search: ~30/min → 2s min. Profile: ~60/min → 1s min.
 	searchDelay  time.Duration
@@ -52,6 +57,9 @@ type Scraper struct {
 
 	// Session token.
 	msToken string
+
+	// Device fingerprint (generated once per Scraper instance).
+	deviceID string
 }
 
 // defaultTransport returns an http.Transport optimized for scraping:
@@ -83,9 +91,18 @@ func New() *Scraper {
 		userAgent:    defaultUserAgent,
 		searchDelay:  2 * time.Second,
 		profileDelay: 1 * time.Second,
+		deviceID:     generateDeviceID(),
 	}
 	s.signFunc = s.signURL
+	s.fetchFunc = s.browserFetch
 	return s
+}
+
+// generateDeviceID creates a random 19-digit device ID (mimics TikTok web).
+func generateDeviceID() string {
+	// 19-digit random number starting with 7 (matches TikTok pattern).
+	id := int64(7e18) + rand.Int64N(int64(1e18))
+	return strconv.FormatInt(id, 10)
 }
 
 // WithSearchDelay sets the minimum delay between search/hashtag API requests.
@@ -144,6 +161,41 @@ func (s *Scraper) SetProxy(proxyAddr string) error {
 	return nil
 }
 
+// buildAPIParams returns the base query parameters required by TikTok's web API.
+// These mimic a real Chrome browser session and are appended to every API request.
+func (s *Scraper) buildAPIParams() url.Values {
+	p := url.Values{}
+	p.Set("aid", "1988")
+	p.Set("app_language", "en")
+	p.Set("app_name", "tiktok_web")
+	p.Set("browser_language", "en-US")
+	p.Set("browser_name", "Mozilla")
+	p.Set("browser_online", "true")
+	p.Set("browser_platform", "MacIntel")
+	p.Set("browser_version", s.userAgent)
+	p.Set("channel", "tiktok_web")
+	p.Set("cookie_enabled", "true")
+	p.Set("device_id", s.deviceID)
+	p.Set("device_platform", "web_pc")
+	p.Set("focus_state", "true")
+	p.Set("history_len", strconv.Itoa(2+rand.IntN(8)))
+	p.Set("is_fullscreen", "false")
+	p.Set("is_page_visible", "true")
+	p.Set("language", "en")
+	p.Set("os", "mac")
+	p.Set("priority_region", "")
+	p.Set("referer", "")
+	p.Set("region", "US")
+	p.Set("screen_height", "1080")
+	p.Set("screen_width", "1920")
+	p.Set("tz_name", "America/New_York")
+	p.Set("webcast_language", "en")
+	if s.msToken != "" {
+		p.Set("msToken", s.msToken)
+	}
+	return p
+}
+
 // doRequest builds and executes an HTTP request with standard TikTok headers.
 // No built-in rate limiting — callers use waitForSearch or waitForProfile.
 func (s *Scraper) doRequest(ctx context.Context, method, urlStr string, body io.Reader) (*http.Response, error) {
@@ -158,10 +210,21 @@ func (s *Scraper) doRequest(ctx context.Context, method, urlStr string, body io.
 	req.Header.Set("Referer", "https://www.tiktok.com/")
 	req.Header.Set("Origin", "https://www.tiktok.com")
 
+	// Chrome client hints — anti-bot systems check for these.
+	req.Header.Set("Sec-Ch-Ua", `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
+
+	// Capture fresh msToken from response — TikTok rotates it per request.
+	s.extractMsToken(resp)
 
 	switch resp.StatusCode {
 	case http.StatusTooManyRequests:
@@ -173,6 +236,24 @@ func (s *Scraper) doRequest(ctx context.Context, method, urlStr string, body io.
 	}
 
 	return resp, nil
+}
+
+// extractMsToken updates the cached msToken from response headers or cookies.
+// TikTok sends a fresh token via X-Ms-Token header and Set-Cookie on every response.
+func (s *Scraper) extractMsToken(resp *http.Response) {
+	// Prefer X-Ms-Token header (always present when token rotates).
+	if token := resp.Header.Get("X-Ms-Token"); token != "" {
+		s.msToken = token
+		return
+	}
+
+	// Fallback: extract from Set-Cookie.
+	for _, c := range resp.Cookies() {
+		if c.Name == "msToken" {
+			s.msToken = c.Value
+			return
+		}
+	}
 }
 
 // waitForSearch enforces rate limiting for search/hashtag API calls.

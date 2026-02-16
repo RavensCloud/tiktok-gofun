@@ -17,9 +17,11 @@ Go 1.25 | Dependencies: `go-rod/rod`, `go-rod/stealth`, `golang.org/x/net`
 | Path | Method | Speed | Browser? |
 |------|--------|-------|----------|
 | User profiles | SSR HTML parsing (`__UNIVERSAL_DATA_FOR_REHYDRATION__`) | ~200ms | No |
-| Search/hashtag | Browser signs URL via `frontierSign()` JS + pure HTTP fetch | ~300ms | Signing only |
+| Search/hashtag | Browser signs URL + fetches via JS `fetch()` in one atomic call | ~300ms | Sign + fetch |
 
-The browser stays open in the background exclusively for URL signing (~50ms per call). All data fetching uses `net/http` with connection pooling.
+Search uses `browserFetch()` which signs the URL via `frontierSign()` and fetches using the browser's `fetch()` API in a single JS eval. This ensures the browser's TLS fingerprint and cookies are used consistently, avoiding anti-bot detection from fingerprint mismatches.
+
+User profiles use pure `net/http` with SSR parsing (no browser needed).
 
 ## Project Structure
 
@@ -28,15 +30,15 @@ tiktok-gofun/
 ├── go.mod                  # github.com/RavensCloud/tiktok-gofun
 ├── errors.go               # Sentinel errors
 ├── types.go                # Video, Author (public types)
-├── types_raw.go            # Raw JSON structs + parseVideo/parseAuthor
+├── types_raw.go            # Raw JSON structs (flat format) + parseVideo/parseAuthor
 ├── scraper.go              # Scraper struct, New(), proxy, cookies, HTTP, rate limiting
 ├── ssr.go                  # __UNIVERSAL_DATA_FOR_REHYDRATION__ extraction
 ├── user.go                 # GetUser() via SSR parsing (pure HTTP)
-├── browser.go              # go-rod lifecycle, stealth, signURL() [build tag: !unittest]
+├── browser.go              # go-rod lifecycle, stealth, browserFetch(), signURL() [build tag: !unittest]
 ├── browser_stub.go         # No-op stubs for unit testing [build tag: unittest]
 ├── auth.go                 # Login, cookie sync browser→HTTP [build tag: !unittest]
 ├── auth_stub.go            # No-op stubs for unit testing [build tag: unittest]
-├── search.go               # SearchVideos(), SearchByHashtag()
+├── search.go               # SearchVideos(), SearchByHashtag() via browserAPIRequest()
 ├── scraper_test.go         # Unit + integration tests
 ├── cmd/tiktok/main.go      # CLI for testing
 └── document.md             # Design reference document
@@ -47,13 +49,13 @@ tiktok-gofun/
 | File | Purpose | Browser | HTTP |
 |------|---------|---------|------|
 | `scraper.go` | Core struct, constructor, proxy, cookies, HTTP client, rate limiting | Fields only | Yes |
-| `search.go` | SearchVideos, SearchByHashtag with cursor pagination | Sign only | Yes |
+| `search.go` | SearchVideos, SearchByHashtag via `browserAPIRequest()` using `fetchFunc` | Via fetchFunc | No |
 | `user.go` | GetUser via SSR HTML parsing | No | Yes |
 | `ssr.go` | Parse `__UNIVERSAL_DATA_FOR_REHYDRATION__` from HTML | No | No |
-| `browser.go` | Browser lifecycle, stealth mode, signURL, resource blocking | Yes | No |
+| `browser.go` | Browser lifecycle, stealth mode, `browserFetch()`, `signURL()`, resource blocking | Yes | No |
 | `auth.go` | Login automation, cookie sync browser→HTTP | Yes | Yes |
 | `types.go` | Public Video and Author structs | - | - |
-| `types_raw.go` | Internal JSON structs matching TikTok API, conversion functions | - | - |
+| `types_raw.go` | Internal JSON structs matching TikTok API (flat format), conversion functions | - | - |
 | `errors.go` | Sentinel errors (ErrRateLimited, ErrNotFound, etc.) | - | - |
 
 ## Core Design
@@ -68,18 +70,28 @@ type Scraper struct {
     userAgent    string
     isLogged     bool
 
-    browser      *rod.Browser      // Headless Chrome (signing only)
+    browser      *rod.Browser      // Headless Chrome
     page         *rod.Page          // Reusable page with TikTok JS loaded
-    browserMu    sync.Mutex         // Protects concurrent signURL calls
+    browserMu    sync.Mutex         // Protects concurrent browser calls
     signingReady atomic.Bool        // Cached signing readiness
 
-    signFunc     func(string) (string, error)  // Replaceable for testing
+    signFunc     func(string) (string, error)  // Signs URL via browser JS (replaceable for testing)
+    fetchFunc    func(string) ([]byte, error)   // Signs + fetches via browser JS fetch() (replaceable for testing)
 
     searchDelay  time.Duration      // 2s default (~30 req/min)
     profileDelay time.Duration      // 1s default (~60 req/min)
     // + per-type mutexes and timestamps
 }
 ```
+
+### Browser Fetch (Sign + Fetch Atomically)
+
+Search/hashtag requests use `browserFetch()` which executes a single JS eval that:
+1. Signs the URL via `window.byted_acrawler.frontierSign(url)`
+2. Fetches the signed URL via `fetch()` with `credentials: 'include'`
+3. Returns the response body as text
+
+This avoids TLS fingerprint mismatches between Go's `net/http` and the browser. On failure, marks `signingReady=false` so the next call reloads the page.
 
 ### Rate Limiting
 
@@ -88,7 +100,7 @@ Per-operation-type rate limiting (not global):
 - **User profiles**: 1s minimum delay + 0-500ms jitter
 - Independent mutexes — profile requests don't wait for search cooldown
 
-### HTTP Transport
+### HTTP Transport (used for user profiles only)
 
 ```go
 MaxIdleConns:        100
@@ -98,9 +110,19 @@ TLSHandshakeTimeout: 10s
 KeepAlive:           30s
 ```
 
-### URL Signing
+### TikTok API Response Format
 
-Browser JS eval with 5s timeout. Uses `atomic.Bool` to cache signing readiness — avoids redundant JS checks per call. On failure, marks `signingReady=false` so next call reloads the page.
+TikTok returns **flat JSON** (no `data` envelope):
+
+```go
+// Search response
+{"status_code": 0, "item_list": [...], "has_more": 1, "cursor": 20}
+
+// Hashtag item list (camelCase variant)
+{"itemList": [...], "hasMore": true, "cursor": 20}
+```
+
+Note: field naming is inconsistent between endpoints (snake_case vs camelCase, int vs bool for `has_more`).
 
 ## Public API
 
@@ -181,7 +203,7 @@ Browser/auth code uses build tags to separate unit-testable and integration code
 ### Running Tests
 
 ```bash
-# Unit tests (no Chrome required, 94%+ coverage)
+# Unit tests (no Chrome required, 93%+ coverage)
 go test -tags unittest -short -race -cover ./...
 
 # All tests including integration (requires network)
@@ -194,14 +216,13 @@ go tool cover -func=coverage.out
 
 ### Coverage
 
-With `unittest` tag: **94.3%** statement coverage. All non-browser code is 100% covered.
-
-Without tag: **69.1%** (browser/auth code at 0% — requires Chrome for integration tests).
+With `unittest` tag: **93.1%** statement coverage. All non-browser code is fully covered.
 
 ### Test Strategy
 
 - **Mock-based**: `httptest.NewServer` for all HTTP endpoints
 - **`baseURL` override**: Scraper's `baseURL` field points to test server
+- **`fetchFunc` override**: Injected HTTP GET function bypasses browser signing + fetching
 - **`signFunc` override**: Injected identity function bypasses browser signing
 - **`newMockScraper()`**: Helper creates scraper wired to test server with zero delays
 
@@ -223,27 +244,9 @@ go run ./cmd/tiktok --hashtag "crypto" --limit 10 --cookies cookies.json --proxy
 | Endpoint | Purpose | Signing |
 |----------|---------|---------|
 | `GET /@{username}` (HTML) | User profile via SSR | No |
-| `GET /api/search/item/full/` | Search videos by keyword | X-Bogus |
-| `GET /api/challenge/detail/` | Get hashtag/challenge ID | X-Bogus |
-| `GET /api/challenge/item_list/` | Videos by hashtag | X-Bogus |
-
-## Viraly Integration
-
-```
-tiktok-gofun (this library)
-    │  import
-    ▼
-viraly/foundation/tiktok/scraper.go
-    │  LibraryScraper wraps Scraper + health tracking
-    ▼
-viraly/app/domain/social/adapters.go
-    │  TiktokAdapter converts types
-    ▼
-viraly/app/domain/social/social.go
-    │  Orchestrator polls alongside Twitter/Telegram
-    ▼
-Hype Engine → Signals → WebSocket
-```
+| `GET /api/search/item/full/` | Search videos by keyword | X-Bogus (via browserFetch) |
+| `GET /api/challenge/detail/` | Get hashtag/challenge ID | X-Bogus (via browserFetch) |
+| `GET /api/challenge/item_list/` | Videos by hashtag | X-Bogus (via browserFetch) |
 
 ## Development
 

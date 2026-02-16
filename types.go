@@ -19,9 +19,12 @@ type Video struct {
 type Author struct {
 	ID             string
 	Username       string
+	Nickname       string // Display name (bot detection: random/empty patterns).
 	FollowerCount  int
 	FollowingCount int
 	VideoCount     int
+	HeartCount     int // Total likes received across all videos.
+	DiggCount      int // Total likes given by the user.
 	Verified       bool
 	Bio            string
 	AvatarURL      string
