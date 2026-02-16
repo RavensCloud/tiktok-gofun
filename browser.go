@@ -69,6 +69,8 @@ func (s *Scraper) setupResourceBlocking() {
 }
 
 // signURL calls TikTok's frontierSign JS to generate the X-Bogus signature.
+// frontierSign returns an object like {"X-Bogus": "xxx"} — we append those
+// params to the original URL.
 // Caller must hold browserMu.
 func (s *Scraper) signURL(rawURL string) (string, error) {
 	if s.page == nil {
@@ -82,11 +84,21 @@ func (s *Scraper) signURL(rawURL string) (string, error) {
 	// Timeout the JS eval to avoid hanging forever.
 	page := s.page.Timeout(5 * time.Second)
 
+	// Returns the signed URL directly by appending params from frontierSign.
 	result, err := page.Eval(`(url) => {
 		if (typeof window.byted_acrawler === 'undefined') {
 			throw new Error('signing function not available');
 		}
-		return window.byted_acrawler.frontierSign(url);
+		const params = window.byted_acrawler.frontierSign(url);
+		if (typeof params === 'string') {
+			return params;
+		}
+		// frontierSign returns an object {X-Bogus: "xxx", ...}
+		const u = new URL(url);
+		for (const [k, v] of Object.entries(params)) {
+			u.searchParams.set(k, v);
+		}
+		return u.toString();
 	}`, rawURL)
 	if err != nil {
 		// Mark signing as not ready so next call will reload.

@@ -17,10 +17,13 @@ func main() {
 	limit := flag.Int("limit", 10, "Max results to return")
 	cookies := flag.String("cookies", "", "Path to cookies JSON file")
 	proxyURL := flag.String("proxy", "", "Proxy URL (http/https/socks5)")
+	login := flag.Bool("login", false, "Login with --user and --pass, then save cookies")
+	pass := flag.String("pass", "", "TikTok password (used with --login)")
+	saveCookies := flag.String("save-cookies", "cookies.json", "Path to save cookies after login")
 	flag.Parse()
 
-	if *user == "" && *search == "" && *hashtag == "" {
-		fmt.Fprintln(os.Stderr, "usage: tiktok --user <username> | --search <keyword> | --hashtag <tag>")
+	if *user == "" && *search == "" && *hashtag == "" && !*login {
+		fmt.Fprintln(os.Stderr, "usage: tiktok --user <username> | --search <keyword> | --hashtag <tag> | --login --user <user> --pass <pass>")
 		os.Exit(1)
 	}
 
@@ -35,8 +38,27 @@ func main() {
 
 	ctx := context.Background()
 
+	// Login mode: authenticate and save cookies.
+	if *login {
+		if *user == "" || *pass == "" {
+			log.Fatal("--login requires --user and --pass")
+		}
+		if err := s.InitBrowser(); err != nil {
+			log.Fatalf("init browser: %v", err)
+		}
+		fmt.Println("Logging in...")
+		if err := s.Login(*user, *pass); err != nil {
+			log.Fatalf("login: %v", err)
+		}
+		if err := s.SaveCookies(*saveCookies); err != nil {
+			log.Fatalf("save cookies: %v", err)
+		}
+		fmt.Printf("Logged in! Cookies saved to %s\n", *saveCookies)
+		return
+	}
+
 	// User profile lookup (pure HTTP, no browser needed).
-	if *user != "" {
+	if *user != "" && *search == "" && *hashtag == "" {
 		author, err := s.GetUser(ctx, *user)
 		if err != nil {
 			log.Fatalf("get user: %v", err)
@@ -46,13 +68,12 @@ func main() {
 	}
 
 	// Search and hashtag require browser + cookies.
+	if err := s.InitBrowser(); err != nil {
+		log.Fatalf("init browser: %v", err)
+	}
 	if *cookies != "" {
 		if err := s.LoginWithCookies(*cookies); err != nil {
 			log.Fatalf("login with cookies: %v", err)
-		}
-	} else {
-		if err := s.InitBrowser(); err != nil {
-			log.Fatalf("init browser: %v", err)
 		}
 	}
 
