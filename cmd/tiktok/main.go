@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	tiktok "github.com/RavensCloud/tiktok-gofun"
 )
@@ -20,6 +21,7 @@ func main() {
 	login := flag.Bool("login", false, "Login with --user and --pass, then save cookies")
 	pass := flag.String("pass", "", "TikTok password (used with --login)")
 	saveCookies := flag.String("save-cookies", "cookies.json", "Path to save cookies after login")
+	debug := flag.Bool("debug", false, "Enable performance timing output")
 	flag.Parse()
 
 	if *user == "" && *search == "" && *hashtag == "" && !*login {
@@ -29,6 +31,10 @@ func main() {
 
 	s := tiktok.New()
 	defer s.Close()
+
+	if *debug {
+		s.SetDebug(true)
+	}
 
 	if *proxyURL != "" {
 		if err := s.SetProxy(*proxyURL); err != nil {
@@ -59,39 +65,56 @@ func main() {
 
 	// User profile lookup (pure HTTP, no browser needed).
 	if *user != "" && *search == "" && *hashtag == "" {
+		start := time.Now()
 		author, err := s.GetUser(ctx, *user)
 		if err != nil {
 			log.Fatalf("get user: %v", err)
 		}
+		cliLog(*debug, "GetUser: %v", time.Since(start))
 		printAuthor(author)
 		return
 	}
 
 	// Search and hashtag require browser + cookies.
+	start := time.Now()
 	if err := s.InitBrowser(); err != nil {
 		log.Fatalf("init browser: %v", err)
 	}
+	cliLog(*debug, "InitBrowser: %v", time.Since(start))
+
 	if *cookies != "" {
+		start = time.Now()
 		if err := s.LoginWithCookies(*cookies); err != nil {
 			log.Fatalf("login with cookies: %v", err)
 		}
+		cliLog(*debug, "LoginWithCookies: %v", time.Since(start))
 	}
 
 	if *search != "" {
+		start = time.Now()
 		videos, err := s.SearchVideos(ctx, *search, *limit)
 		if err != nil {
 			log.Fatalf("search: %v", err)
 		}
+		cliLog(*debug, "SearchVideos: %v", time.Since(start))
 		printVideos(videos)
 		return
 	}
 
 	if *hashtag != "" {
+		start = time.Now()
 		videos, err := s.SearchByHashtag(ctx, *hashtag, *limit)
 		if err != nil {
 			log.Fatalf("hashtag search: %v", err)
 		}
+		cliLog(*debug, "SearchByHashtag: %v", time.Since(start))
 		printVideos(videos)
+	}
+}
+
+func cliLog(enabled bool, format string, args ...any) {
+	if enabled {
+		fmt.Fprintf(os.Stderr, "[timing] "+format+"\n", args...)
 	}
 }
 

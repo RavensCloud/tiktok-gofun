@@ -3,6 +3,7 @@
 package tiktok
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -116,22 +117,29 @@ func (s *Scraper) signURL(rawURL string) (string, error) {
 // net/http client and the browser that signed the URL.
 // Caller must hold browserMu.
 func (s *Scraper) browserFetch(rawURL string) ([]byte, error) {
+	totalStart := time.Now()
+
 	if s.page == nil {
 		return nil, ErrBrowserNotReady
 	}
 
+	signingStart := time.Now()
 	if err := s.ensureSigningReady(); err != nil {
 		return nil, fmt.Errorf("ensure signing ready: %w", err)
 	}
+	perfLog("browserFetch: ensureSigningReady=%v", time.Since(signingStart))
 
 	page := s.page.Timeout(15 * time.Second)
 
 	// Sign the URL and fetch it in one JS call to keep everything consistent.
+	evalStart := time.Now()
 	result, err := page.Eval(`async (url) => {
 		if (typeof window.byted_acrawler === 'undefined') {
 			throw new Error('signing function not available');
 		}
+		const t0 = Date.now();
 		const params = window.byted_acrawler.frontierSign(url);
+		const signMs = Date.now() - t0;
 		let signedUrl;
 		if (typeof params === 'string') {
 			signedUrl = params;
@@ -142,6 +150,7 @@ func (s *Scraper) browserFetch(rawURL string) ([]byte, error) {
 			}
 			signedUrl = u.toString();
 		}
+		const t1 = Date.now();
 		const resp = await fetch(signedUrl, {
 			method: 'GET',
 			credentials: 'include',
@@ -149,19 +158,43 @@ func (s *Scraper) browserFetch(rawURL string) ([]byte, error) {
 				'Accept': 'application/json, text/plain, */*',
 			},
 		});
+		const fetchMs = Date.now() - t1;
+		const t2 = Date.now();
 		const text = await resp.text();
-		return text;
+		const readMs = Date.now() - t2;
+		return JSON.stringify({body: text, signMs, fetchMs, readMs});
 	}`, rawURL)
+	evalDur := time.Since(evalStart)
 	if err != nil {
 		s.signingReady.Store(false)
+		perfLog("browserFetch: eval FAILED after %v", evalDur)
 		return nil, fmt.Errorf("%w: %v", ErrSigningFailed, err)
 	}
 
-	body := result.Value.Str()
-	if body == "" {
+	// Parse timing from JS result.
+	raw := result.Value.Str()
+	var jsResult struct {
+		Body    string `json:"body"`
+		SignMs  int    `json:"signMs"`
+		FetchMs int    `json:"fetchMs"`
+		ReadMs  int    `json:"readMs"`
+	}
+	if err := json.Unmarshal([]byte(raw), &jsResult); err != nil {
+		// Fallback: old format (plain text).
+		perfLog("browserFetch: eval=%v total=%v (timing parse failed)", evalDur, time.Since(totalStart))
+		if raw == "" {
+			return nil, nil
+		}
+		return []byte(raw), nil
+	}
+
+	perfLog("browserFetch: js_sign=%dms js_fetch=%dms js_read=%dms eval=%v total=%v body=%d bytes",
+		jsResult.SignMs, jsResult.FetchMs, jsResult.ReadMs, evalDur, time.Since(totalStart), len(jsResult.Body))
+
+	if jsResult.Body == "" {
 		return nil, nil
 	}
-	return []byte(body), nil
+	return []byte(jsResult.Body), nil
 }
 
 // ensureSigningReady checks if the signing JS is available, reloading only if

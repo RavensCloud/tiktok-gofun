@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // browserAPIRequest builds the full API URL and fetches it via the browser.
@@ -15,6 +16,8 @@ func (s *Scraper) browserAPIRequest(
 	path string,
 	setParams func(p map[string]string),
 ) ([]byte, error) {
+	totalStart := time.Now()
+
 	params := s.buildAPIParams()
 
 	// Apply caller-specific params.
@@ -25,10 +28,16 @@ func (s *Scraper) browserAPIRequest(
 	}
 
 	rawURL := s.baseURL + path + "?" + params.Encode()
+	buildDur := time.Since(totalStart)
 
+	fetchStart := time.Now()
 	s.browserMu.Lock()
 	body, err := s.fetchFunc(rawURL)
 	s.browserMu.Unlock()
+	fetchDur := time.Since(fetchStart)
+
+	perfLog("browserAPIRequest: path=%s build=%v fetch=%v total=%v", path, buildDur, fetchDur, time.Since(totalStart))
+
 	if err != nil {
 		return nil, fmt.Errorf("browser fetch: %w", err)
 	}

@@ -22,6 +22,16 @@ import (
 
 const defaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+// debugPerf enables performance timing output to stderr.
+var debugPerf bool
+
+// perfLog prints a performance timing message to stderr when debug is enabled.
+func perfLog(format string, args ...any) {
+	if debugPerf {
+		fmt.Fprintf(os.Stderr, "[perf] "+format+"\n", args...)
+	}
+}
+
 var tiktokURL, _ = url.Parse("https://www.tiktok.com")
 
 // Scraper is the main TikTok scraper. It uses pure HTTP for user profiles
@@ -103,6 +113,12 @@ func generateDeviceID() string {
 	// 19-digit random number starting with 7 (matches TikTok pattern).
 	id := int64(7e18) + rand.Int64N(int64(1e18))
 	return strconv.FormatInt(id, 10)
+}
+
+// SetDebug enables performance timing output to stderr.
+func (s *Scraper) SetDebug(enabled bool) *Scraper {
+	debugPerf = enabled
+	return s
 }
 
 // WithSearchDelay sets the minimum delay between search/hashtag API requests.
@@ -275,13 +291,23 @@ func (s *Scraper) throttle(lastReq *time.Time, delay time.Duration) {
 	if delay == 0 {
 		return
 	}
-	elapsed := time.Since(*lastReq)
+	start := time.Now()
+
+	// First call — no previous request, skip the wait.
+	if lastReq.IsZero() {
+		*lastReq = start
+		perfLog("throttle: first_call delay=%v skipped=true", delay)
+		return
+	}
+
+	elapsed := start.Sub(*lastReq)
 	jitter := time.Duration(rand.Int64N(int64(500 * time.Millisecond)))
 	wait := delay + jitter - elapsed
 	if wait > 0 {
 		time.Sleep(wait)
 	}
 	*lastReq = time.Now()
+	perfLog("throttle: delay=%v jitter=%v elapsed=%v slept=%v", delay, jitter, elapsed, time.Since(start))
 }
 
 // GetCookies returns the current session cookies for tiktok.com.
