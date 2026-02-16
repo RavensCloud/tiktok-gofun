@@ -1,7 +1,7 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# ===================
+# Go
+# ===================
+# Binaries
 *.exe
 *.exe~
 *.dll
@@ -11,22 +11,85 @@
 # Test binary, built with `go test -c`
 *.test
 
-# Code coverage profiles and other test artifacts
+# Output of the go coverage tool
 *.out
-coverage.*
-*.coverprofile
-profile.cov
-
-# Dependency directories (remove the comment below to include it)
-# vendor/
 
 # Go workspace file
 go.work
 go.work.sum
 
-# env file
-.env
+# Dependency directories
+vendor/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# Go build cache
+.cache/
+
+# ===================
+# Visual Studio / VS Code
+# ===================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vsidx
+*.vspscc
+*.vsscc
+
+# Visual Studio Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ===================
+# Node.js / Astro
+# ===================
+node_modules/
+dist/
+.astro/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+
+# Package manager lock files (optional - uncomment if you want to ignore)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Build output
+build/
+.output/
+
+# ===================
+# JetBrains IDEs
+# ===================
+.idea/
+
+# ===================
+# OS Generated
+# ===================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===================
+# Misc
+# ===================
+*.log
+*.tmp
+*.temp
+*.swp
+*~
